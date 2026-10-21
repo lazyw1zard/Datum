@@ -89,4 +89,8 @@ python -m unittest discover -s tests
 - Галерея всех деталей и версий: маленький локальный сервер.
 - Согласование версий (принять / отклонить) — если понадобится, как было в CADRelay.
 
-Three.js — MIT, `src/datum/vendor/THREE_LICENSE`.
+## Лицензия и данные
+
+Код — MIT (`LICENSE`); Three.js — тоже MIT, `src/datum/vendor/THREE_LICENSE`.
+
+Детали — данные, а не код: они живут в доме Datum на вашей машине (`$DATUM_HOME`, по умолчанию `~/Datum`) и в репозиторий не попадают. `.gitignore` дополнительно отсекает `parts/`, `*.stl` и `*.3mf`.

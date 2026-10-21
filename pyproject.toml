@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,6 +8,8 @@ version = "0.1.0"
 description = "Parametric 3D parts for agents and people: OpenSCAD source -> versions with STL, previews, sections and a self-contained 3D view"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE", "src/datum/vendor/THREE_LICENSE"]
 dependencies = [
   "numpy>=1.24",
   "trimesh>=4.4",
