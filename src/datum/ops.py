@@ -164,8 +164,9 @@ def measure(store: Store, slug: str, cuts: list[tuple[str, float]] | None = None
     return {"report": rep, "sections": sections, "text": "\n".join(lines)}
 
 
-def view(store: Store, slug: str, version: str | None = None, *, open_browser: bool = False) -> dict:
-    path = store.version_dir(slug, version) / "view.html"
+def view(store: Store, slug: str, version: str | None = None, *, open_browser: bool = False,
+         refresh: bool = False) -> dict:
+    path = store.refresh_view(slug, version) if refresh else store.version_dir(slug, version) / "view.html"
     if open_browser:
         import webbrowser
         webbrowser.open(path.as_uri())

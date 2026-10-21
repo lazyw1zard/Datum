@@ -84,6 +84,7 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("part")
     s.add_argument("--v", dest="ver")
     s.add_argument("--open", action="store_true", help="открыть в браузере")
+    s.add_argument("--refresh", action="store_true", help="пересобрать view.html этой версии (после обновления Datum)")
 
     s = sub.add_parser("export", help="сохранить сетку версии: .stl .3mf .glb .obj .ply")
     s.add_argument("part")
@@ -119,7 +120,7 @@ def run(args: argparse.Namespace) -> dict:
     if cmd == "measure":
         return ops.measure(store, args.part, _cuts(args.cut), args.ver)
     if cmd == "view":
-        return ops.view(store, args.part, args.ver, open_browser=args.open)
+        return ops.view(store, args.part, args.ver, open_browser=args.open, refresh=args.refresh)
     if cmd == "export":
         return ops.export(store, args.part, args.out, args.ver)
     raise PartError(f"unknown command {cmd}")

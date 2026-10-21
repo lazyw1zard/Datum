@@ -1,11 +1,14 @@
 """A self-contained 3D view of a part: one HTML file, no server, no network.
 
-Three.js (vendored, MIT) is inlined through an import map of data: URLs; the mesh is
-embedded as base64 arrays. The controls follow CADRelay's GlbViewer, rebuilt without React.
+Small enough for a chat side panel (which refuses HTML over 512 KB): Three.js (vendored, MIT)
+is stored gzip-compressed, the mesh is quantized to 16 bits per axis, delta + zigzag + varint
+encoded and gzipped. The page unpacks both with DecompressionStream and loads the modules from
+blob: URLs. The controls follow CADRelay's GlbViewer, rebuilt without React.
 """
 from __future__ import annotations
 
 import base64
+import gzip
 import json
 from functools import lru_cache
 from pathlib import Path
@@ -13,39 +16,67 @@ from pathlib import Path
 import numpy as np
 
 VENDOR = Path(__file__).parent / "vendor"
+PANEL_LIMIT = 512 * 1024   # Claude's desktop side panel opens HTML only up to this size
+
+
+def _gz64(data: bytes) -> str:
+    return base64.b64encode(gzip.compress(data, 9, mtime=0)).decode("ascii")
 
 
 @lru_cache(maxsize=1)
-def _import_map() -> str:
-    def data_url(name: str) -> str:
-        return "data:text/javascript;base64," + base64.b64encode((VENDOR / name).read_bytes()).decode("ascii")
-    return json.dumps({"imports": {
-        "three/core": data_url("three.core.min.js"),
-        "three": data_url("three.module.min.js"),
-        "three/addons/OrbitControls.js": data_url("OrbitControls.js"),
-    }})
+def _vendor() -> str:
+    return json.dumps({
+        "core": _gz64((VENDOR / "three.core.min.js").read_bytes()),
+        "three": _gz64((VENDOR / "three.module.min.js").read_bytes()),
+        "controls": _gz64((VENDOR / "OrbitControls.js").read_bytes()),
+    })
 
 
-def _b64(array: np.ndarray) -> str:
-    return base64.b64encode(np.ascontiguousarray(array).tobytes()).decode("ascii")
+def _varints(values: np.ndarray) -> bytes:
+    """Signed integers -> zigzag -> LEB128 varints."""
+    zig = ((values.astype(np.int64) << 1) ^ (values.astype(np.int64) >> 63)).astype(np.uint64)
+    out = bytearray()
+    for x in zig.tolist():
+        while x >= 0x80:
+            out.append((x & 0x7F) | 0x80)
+            x >>= 7
+        out.append(x)
+    return bytes(out)
+
+
+def encode_mesh(vertices: np.ndarray, faces: np.ndarray) -> dict:
+    """Vertices in order of first use, 16-bit over the bounding box, deltas per axis; face indices as deltas."""
+    v = np.asarray(vertices, dtype=float)
+    f = np.asarray(faces, dtype=np.int64)
+    used, first = np.unique(f.ravel(), return_index=True)
+    order = used[np.argsort(first)]
+    remap = np.full(len(v), -1, dtype=np.int64)
+    remap[order] = np.arange(len(order))
+    v, f = v[order], remap[f]
+    lo = v.min(axis=0)
+    span = np.maximum(v.max(axis=0) - lo, 1e-9)
+    q = np.round((v - lo) / span * 65535).astype(np.int64)
+    dv = np.diff(q, axis=0, prepend=np.zeros((1, 3), dtype=np.int64))
+    di = np.diff(f.ravel(), prepend=0)
+    return {"lo": lo.tolist(), "span": span.tolist(), "vertices": int(len(order)), "triangles": int(len(f)),
+            "v": _gz64(_varints(dv.T.ravel())), "f": _gz64(_varints(di))}
 
 
 def build_html(vertices: np.ndarray, faces: np.ndarray, meta: dict) -> str:
-    data = {
-        "meta": meta,
-        "mesh": {"positions": _b64(np.asarray(vertices, dtype="<f4")), "indices": _b64(np.asarray(faces, dtype="<u4"))},
-    }
+    data = {"meta": meta, "mesh": encode_mesh(vertices, faces)}
     title = meta.get("title") or meta.get("part") or "part"
     payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
     return (_TEMPLATE
             .replace("%%TITLE%%", _html_escape(f"{title} · {meta.get('version', '')}".strip(" ·")))
-            .replace("%%IMPORTMAP%%", _import_map())
+            .replace("%%VENDOR%%", _vendor())
             .replace("%%DATA%%", payload))
 
 
-def write(path: Path, vertices: np.ndarray, faces: np.ndarray, meta: dict) -> Path:
-    path.write_text(build_html(vertices, faces, meta), encoding="utf-8")
-    return path
+def write(path: Path, vertices: np.ndarray, faces: np.ndarray, meta: dict) -> int:
+    """Write view.html; returns its size in bytes."""
+    html = build_html(vertices, faces, meta)
+    path.write_text(html, encoding="utf-8")
+    return path.stat().st_size
 
 
 def _html_escape(text: str) -> str:
@@ -84,9 +115,10 @@ button.on { background:var(--btn-on); color:var(--btn-on-ink); }
 #measure { position:fixed; left:12px; bottom:12px; background:var(--panel); border:1px solid var(--accent); border-radius:10px; padding:8px 12px; display:none; font-variant-numeric: tabular-nums; }
 #hint { color:var(--muted); font-size:12px; }
 #err { position:fixed; inset:0; display:none; place-items:center; color:var(--muted); }
+#loading { position:fixed; inset:0; display:grid; place-items:center; color:var(--muted); padding:24px; text-align:center; }
 @media (max-width: 640px) { #info { max-height:34vh; } button { padding:5px 7px; } }
 </style>
-<script type="importmap">%%IMPORTMAP%%</script>
+<script type="application/json" id="datum-vendor">%%VENDOR%%</script>
 <script type="application/json" id="datum-data">%%DATA%%</script>
 </head>
 <body>
@@ -116,7 +148,8 @@ button.on { background:var(--btn-on); color:var(--btn-on-ink); }
 <div id="measure"></div>
 <div id="info"></div>
 <div id="err">WebGL недоступен в этом окне — откройте файл в браузере.</div>
-<script type="module">
+<div id="loading">Загрузка…</div>
+<script type="text/plain" id="datum-app">
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/OrbitControls.js";
 
@@ -129,11 +162,6 @@ const LIGHTS = [
   { id:"flat", label:"ровный", hemi:1.35, sky:0xffffff, ground:0xffffff, key:0.15, keyPos:[0,6,4], fill:0.15, fillPos:[0,3,-4], exposure:0.98 },
 ];
 
-function decode(b64, Type) {
-  const bin = atob(b64), bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return new Type(bytes.buffer);
-}
 const fmt = (v, d = 2) => (Math.round(v * 10 ** d) / 10 ** d).toLocaleString("ru-RU", { maximumFractionDigits: d });
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
 
@@ -157,8 +185,8 @@ const fill = new THREE.DirectionalLight(0xffffff, 0.25);
 scene.add(hemi, key, fill);
 
 let geometry = new THREE.BufferGeometry();
-geometry.setAttribute("position", new THREE.BufferAttribute(decode(DATA.mesh.positions, Float32Array), 3));
-geometry.setIndex(new THREE.BufferAttribute(decode(DATA.mesh.indices, Uint32Array), 1));
+geometry.setAttribute("position", new THREE.BufferAttribute(window.DATUM_MESH.positions, 3));
+geometry.setIndex(new THREE.BufferAttribute(window.DATUM_MESH.indices, 1));
 geometry = geometry.toNonIndexed();          // flat normals: crisp CAD faces
 geometry.rotateX(-Math.PI / 2);              // part is Z-up (OpenSCAD); the scene is Y-up
 geometry.computeVertexNormals();
@@ -367,6 +395,54 @@ applyLight();
 applyTheme();
 resize();
 renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
+document.getElementById("loading").remove();
+</script>
+<script type="module">
+// Unpack Three.js and the mesh, then run the app from blob: URLs (no import map, no network).
+const say = (text) => { document.getElementById("loading").textContent = text; };
+async function gunzip(b64) {
+  const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+const text = async (b64) => new TextDecoder().decode(await gunzip(b64));
+const moduleUrl = (source) => URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+function varints(bytes, n) {            // zigzag LEB128 -> signed numbers
+  const out = new Float64Array(n);
+  let i = 0;
+  for (let k = 0; k < n; k++) {
+    let x = 0, mul = 1, b;
+    do { b = bytes[i++]; x += (b & 0x7f) * mul; mul *= 128; } while (b & 0x80);
+    out[k] = x % 2 ? -(x + 1) / 2 : x / 2;
+  }
+  return out;
+}
+try {
+  if (typeof DecompressionStream === "undefined") throw new Error("этот браузер не умеет DecompressionStream");
+  const V = JSON.parse(document.getElementById("datum-vendor").textContent);
+  const M = JSON.parse(document.getElementById("datum-data").textContent).mesh;
+  const nv = M.vertices, nf = M.triangles;
+  const dv = varints(await gunzip(M.v), nv * 3), di = varints(await gunzip(M.f), nf * 3);
+  const positions = new Float32Array(nv * 3);
+  for (let a = 0; a < 3; a++) {
+    let acc = 0;
+    const scale = M.span[a] / 65535;
+    for (let i = 0; i < nv; i++) { acc += dv[a * nv + i]; positions[i * 3 + a] = M.lo[a] + acc * scale; }
+  }
+  const indices = new Uint32Array(nf * 3);
+  for (let i = 0, acc = 0; i < nf * 3; i++) { acc += di[i]; indices[i] = acc; }
+  window.DATUM_MESH = { positions, indices };
+  const core = moduleUrl(await text(V.core));
+  const three = moduleUrl((await text(V.three)).replaceAll('"three/core"', JSON.stringify(core)));
+  const controls = moduleUrl((await text(V.controls)).replace(/from\s*['"]three['"]/g, "from " + JSON.stringify(three)));
+  const app = document.getElementById("datum-app").textContent
+    .replace('from "three/addons/OrbitControls.js"', "from " + JSON.stringify(controls))
+    .replace('from "three"', "from " + JSON.stringify(three));
+  await import(moduleUrl(app));
+} catch (e) {
+  say("Не удалось открыть 3D: " + e.message);
+  console.error(e);
+}
 </script>
 </body>
 </html>

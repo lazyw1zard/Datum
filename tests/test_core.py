@@ -133,17 +133,42 @@ class ThreeMF(unittest.TestCase):
             self.assertTrue(np.allclose(v.min(axis=0), [100, 0, 50]))
 
 
+def _unvarints(b64: str, n: int) -> np.ndarray:
+    import base64
+    import gzip
+    data, out, i = gzip.decompress(base64.b64decode(b64)), [], 0
+    while len(out) < n:
+        x = shift = 0
+        while True:
+            b = data[i]
+            i += 1
+            x |= (b & 0x7F) << shift
+            shift += 7
+            if not b & 0x80:
+                break
+        out.append((x >> 1) ^ -(x & 1))
+    return np.array(out)
+
+
 class Viewer(unittest.TestCase):
     def test_self_contained(self):
         m = tube()
         html = viewer.build_html(m.vertices, m.faces, {"part": "t", "version": "v001", "title": "Труба </script>"})
-        self.assertIn('<script type="importmap">', html)
-        self.assertNotIn("https://", html.split("<script type=\"module\">")[0])
+        self.assertNotIn("https://", html)
+        self.assertLess(len(html.encode("utf-8")), viewer.PANEL_LIMIT)
         data = re.search(r'<script type="application/json" id="datum-data">(.*?)</script>', html, re.S).group(1)
         payload = json.loads(data.replace("<\\/", "</"))
         self.assertEqual(payload["meta"]["title"], "Труба </script>")
-        self.assertEqual(len(np.frombuffer(__import__("base64").b64decode(payload["mesh"]["indices"]), "<u4")),
-                         m.faces.size)
+
+    def test_mesh_packing_is_lossless_enough(self):
+        """Every triangle kept; vertices within a micron after 16-bit quantization."""
+        m = tube()
+        e = viewer.encode_mesh(m.vertices, m.faces)
+        nv, nf = e["vertices"], e["triangles"]
+        self.assertEqual(nf, len(m.faces))
+        pos = np.array(e["lo"]) + _unvarints(e["v"], nv * 3).reshape(3, nv).cumsum(axis=1).T * np.array(e["span"]) / 65535
+        idx = _unvarints(e["f"], nf * 3).cumsum().reshape(nf, 3)
+        self.assertLess(np.abs(pos[idx] - m.vertices[m.faces]).max(), 0.001)
 
 
 class MCP(unittest.TestCase):

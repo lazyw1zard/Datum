@@ -225,7 +225,7 @@ class Store:
                 previews = {}
                 meta["warnings"].append(f"no previews: {exc}")
             meta["previews"] = {k: p.name for k, p in previews.items()}
-            viewer.write(vdir / "view.html", part_mesh.vertices, part_mesh.faces, meta)
+            self._write_view(vdir, part_mesh, meta)
             meta["status"] = "ok"
         except (PartError, openscad.OpenSCADMissing, RuntimeError, ValueError, OSError) as exc:
             meta["status"] = "failed"
@@ -241,6 +241,25 @@ class Store:
             part["current"], part["updated"] = version, _now()
             self._save(slug, part)
         return {**meta, "dir": str(vdir)}
+
+    @staticmethod
+    def _write_view(vdir: Path, part_mesh, meta: dict) -> int:
+        size = viewer.write(vdir / "view.html", part_mesh.vertices, part_mesh.faces, meta)
+        if size > viewer.PANEL_LIMIT:
+            note = (f"view.html {size // 1024} KB > {viewer.PANEL_LIMIT // 1024} KB: a chat side panel will show it "
+                    "as code; open it in a browser")
+            if note not in meta["warnings"]:
+                meta["warnings"].append(note)
+        return size
+
+    def refresh_view(self, slug: str, version: str | None = None) -> Path:
+        """Rebuild view.html of a built version (a derived file; the version itself stays as it was)."""
+        vdir = self.version_dir(slug, version)
+        meta = json.loads((vdir / "version.json").read_text(encoding="utf-8"))
+        meta["warnings"] = [w for w in meta.get("warnings", []) if not w.startswith("view.html ")]
+        self._write_view(vdir, meshes.load(vdir / "model.stl"), meta)
+        (vdir / "version.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return vdir / "view.html"
 
     # ---------- reading a built version ----------
 
