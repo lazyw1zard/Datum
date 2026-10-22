@@ -183,8 +183,11 @@ def _corners(points: np.ndarray, angle_deg: float = 2.0) -> np.ndarray:
 def _shape(points: np.ndarray, center: np.ndarray) -> dict:
     radii = np.linalg.norm(points - center, axis=1)
     r_mean = float(radii.mean())
-    spread = float(radii.max() - radii.min()) / 2
-    if r_mean > 0 and spread <= max(0.01 * r_mean, 0.02):
+    # Corners alone can sit on one circle (a rectangle's four do); edge midpoints give a polygon away.
+    midpoints = (points + np.roll(points, -1, axis=0)) / 2
+    all_radii = np.concatenate([radii, np.linalg.norm(midpoints - center, axis=1)])
+    spread = float(all_radii.max() - all_radii.min()) / 2
+    if len(points) >= 8 and r_mean > 0 and spread <= max(0.01 * r_mean, 0.02):
         return {"kind": "circle", "diameter": _r(2 * r_mean), "roundness": _r(spread)}
     corners = _corners(points)
     n = len(corners)
@@ -236,15 +239,21 @@ def section(mesh: trimesh.Trimesh, axis: str = "z", at: float | None = None) -> 
     polygons = [(pts, closed) for pts, closed in chains if len(pts) >= 3]
     for idx, (pts, closed) in enumerate(polygons):
         depth = sum(1 for j, (other, oc) in enumerate(polygons) if j != idx and oc and _inside(pts[0], other))
+        encloses = closed and any(j != idx and _inside(other[0], pts) for j, (other, _) in enumerate(polygons))
         center = _centroid(pts)
         lo2, hi2 = pts.min(axis=0), pts.max(axis=0)
+        shape = _shape(pts, center)
+        if shape["kind"] == "outline" and depth % 2 == 0 and not encloses:
+            # A solid outline with nothing inside (a wall in a lengthwise cut): diameters "from the centre"
+            # mean nothing there, its size says it all.
+            shape = {"kind": "outline"}
         loop = {
             "role": "outer" if depth % 2 == 0 else "hole",
             "closed": closed,
             "center": [_r(v) for v in center],
             "size": [_r(v) for v in hi2 - lo2],
             "area_mm2": _r(abs(_area(pts)), 2),
-            **_shape(pts, center),
+            **shape,
             "points": pts,
         }
         result["loops"].append(loop)
@@ -261,8 +270,10 @@ def describe_loop(loop: dict) -> str:
         what = f"{shape}, S{loop['across_flats']:g} (по углам {loop['across_corners']:g})"
     elif shape.endswith("-gon"):
         what = f"{shape}, по углам {loop['across_corners']:g}"
-    else:
+    elif "d_inner" in loop:
         what = f"контур {size}, от центра: Ø{loop['d_inner']:g} до Ø{loop['d_outer']:g}"
+    else:
+        what = f"контур {size}"
     where = ", ".join(f"{v:g}" for v in loop["center"])
     role = "отверстие" if loop["role"] == "hole" else "наружный"
     open_note = "" if loop["closed"] else " (не замкнут!)"

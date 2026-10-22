@@ -88,6 +88,16 @@ class Sections(unittest.TestCase):
         self.assertIn("S8.3", mesh.describe_loop(loop))
         self.assertIn("<svg", mesh.section_svg(cut))
 
+    def test_lengthwise_cut_reports_walls_by_size(self):
+        """A cut along the axis gives two walls; 'diameters from the centre' make no sense for them."""
+        cut = mesh.section(tube(height=40), "y", 0.0)
+        self.assertEqual(len(cut["loops"]), 2)
+        for loop in cut["loops"]:
+            self.assertEqual(loop["kind"], "outline")
+            self.assertNotIn("d_inner", loop)
+            self.assertAlmostEqual(loop["size"][1], 40.0, delta=0.01)
+            self.assertNotIn("от центра", mesh.describe_loop(loop))
+
     def test_plane_on_a_face_is_nudged(self):
         box = trimesh.creation.box(extents=[10, 10, 10])
         cut = mesh.section(box, "z", 5.0 - 5.0)    # through the middle
