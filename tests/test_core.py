@@ -1,4 +1,5 @@
-"""Tests that need no OpenSCAD: parameters, sections, 3MF, the viewer, the MCP protocol."""
+"""Tests that need no OpenSCAD: parameters, sections, 3MF and slicer templates, the viewer, the MCP protocol,
+parts made from meshes."""
 import io
 import json
 import re
@@ -12,8 +13,8 @@ from pathlib import Path
 import numpy as np
 import trimesh
 
-from datum import NAME, mcp, mesh, scad, three_mf, viewer
-from datum.parts import Store
+from datum import NAME, mcp, mesh, ops, scad, three_mf, viewer
+from datum.parts import PartError, Store
 
 SOURCE = """// demo
 D = 25;             // outer diameter
@@ -143,6 +144,69 @@ class ThreeMF(unittest.TestCase):
             self.assertTrue(np.allclose(v.min(axis=0), [100, 0, 50]))
 
 
+def slicer_project(path: Path, items: int = 1) -> None:
+    """A project the way QIDI/Bambu save it: the mesh in its own model file, centred, under a component;
+    the item squashed to half height and placed on the plate; settings beside it."""
+    ns, prod = three_mf.CORE_NS, three_mf.PROD_NS
+    box = trimesh.creation.box(extents=[10, 10, 2])
+    verts = "".join(f'<vertex x="{x:g}" y="{y:g}" z="{z:g}"/>' for x, y, z in box.vertices)
+    tris = "".join(f'<triangle v1="{a}" v2="{b}" v3="{c}"/>' for a, b, c in box.faces)
+    part = (f'<?xml version="1.0" encoding="UTF-8"?>\n<model unit="millimeter" xmlns="{ns}" xmlns:p="{prod}">\n'
+            ' <metadata name="QIDIStudio:3mfVersion">1</metadata>\n <resources>\n'
+            f'  <object id="1" p:UUID="00010000-aaaa" type="model">\n   <mesh><vertices>{verts}</vertices>'
+            f'<triangles>{tris}</triangles></mesh>\n  </object>\n </resources>\n <build/>\n</model>')
+    item = '<item objectid="2" transform="1 0 0 0 1 0 0 0 0.5 100 100 0.5" printable="1"/>'
+    root = (f'<model unit="millimeter" xmlns="{ns}" xmlns:p="{prod}" requiredextensions="p"><resources>'
+            '<object id="2" type="model"><components>'
+            '<component p:path="/3D/Objects/object_1.model" objectid="1" transform="1 0 0 0 1 0 0 0 1 0 0 0"/>'
+            f'</components></object></resources><build>{item * items}</build></model>')
+    settings = ('<config><object id="2"><metadata face_count="12"/><part id="1">'
+                '<metadata key="source_offset_x" value="0"/><metadata key="source_offset_y" value="80"/>'
+                '<metadata key="source_offset_z" value="1"/><mesh_stat face_count="12" edges_fixed="0"/>'
+                '</part></object></config>')
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("_rels/.rels", '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                   f'<Relationship Target="/3D/3dmodel.model" Id="rel-1" Type="{three_mf.MODEL_REL_TYPE}"/>'
+                   '</Relationships>')
+        z.writestr("3D/3dmodel.model", root)
+        z.writestr("3D/Objects/object_1.model", part)
+        z.writestr("Metadata/model_settings.config", settings)
+        z.writestr("Metadata/project_settings.config", '{"layer_height": "0.2", "brim_width": "5"}')
+
+
+class Template(unittest.TestCase):
+    def test_mesh_goes_into_the_project(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project, out = Path(tmp) / "project.3mf", Path(tmp) / "out.3mf"
+            slicer_project(project)
+            new = tube()                                     # 25 × 25 × 10, centred on the origin
+            info = three_mf.replace_mesh(project, out, new.vertices, new.faces)
+            self.assertEqual(info["scale"], [1.0, 1.0, 0.5])
+            self.assertTrue(info["print_settings"])
+            with zipfile.ZipFile(project) as a, zipfile.ZipFile(out) as b:
+                self.assertEqual(a.namelist(), b.namelist())
+                self.assertEqual(a.read("Metadata/project_settings.config"), b.read("Metadata/project_settings.config"))
+                model = b.read("3D/Objects/object_1.model").decode("utf-8")
+                config = b.read("Metadata/model_settings.config").decode("utf-8")
+            self.assertIn('<metadata name="QIDIStudio:3mfVersion">1</metadata>', model)
+            self.assertIn('p:UUID="00010000-aaaa"', model)
+            # on the same spot of the bed: bottom on the plate, centre at (100, 100), the human's half height kept
+            v, f = three_mf.read_mesh(out)
+            self.assertEqual(len(f), len(new.faces))
+            self.assertTrue(np.allclose(v.min(axis=0), [87.5, 87.5, 0.0], atol=1e-4))
+            self.assertTrue(np.allclose(v.max(axis=0), [112.5, 112.5, 5.0], atol=1e-4))
+            self.assertEqual(config.count(f'face_count="{len(new.faces)}"'), 2)
+            self.assertIn('key="source_offset_z" value="-4"', config)     # mesh z -5 moved to the old bottom, -1
+            self.assertIn('key="source_offset_y" value="0"', config)
+
+    def test_one_object_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "two.3mf"
+            slicer_project(project, items=2)
+            with self.assertRaises(ValueError):
+                three_mf.replace_mesh(project, Path(tmp) / "out.3mf", tube().vertices, tube().faces)
+
+
 def _unvarints(b64: str, n: int) -> np.ndarray:
     import base64
     import gzip
@@ -232,6 +296,27 @@ class StoreBasics(unittest.TestCase):
             self.assertEqual(store.load("tube")["engine"], "mesh")
             self.assertEqual(store.params("tube"), [])
             self.assertEqual([p["name"] for p in store.list()], ["tube"])
+            self.assertTrue(Path(store.load("tube")["origin"]).is_absolute())
+
+    def test_pull_from_origin(self):
+        """A generator rewrites its output; the part takes it again, but never over edits made in the part."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(tmp)
+            origin = Path(tmp) / "gen_out.stl"
+            tube().export(origin)
+            ops.new(store, "tube", source=str(origin))
+            same = ops.pull(store, "tube")
+            self.assertEqual(same["changed"], [])
+            self.assertEqual(len(store.versions("tube")), 1)
+            tube(outer=30).export(origin)
+            pulled = ops.pull(store, "tube", note="шире")
+            self.assertEqual(pulled["changed"], ["model.stl"])
+            self.assertEqual(store.versions("tube")[-1]["note"], "шире")
+            self.assertAlmostEqual(store.version_meta("tube")["report"]["bbox"]["size"][0], 30.0, delta=0.01)
+            tube(outer=20).export(store.source("tube"))            # a hand edit in the part itself
+            with self.assertRaises(PartError):
+                store.pull("tube")
+            self.assertEqual(store.pull("tube", force=True)["changed"], ["model.stl"])
 
 
 if __name__ == "__main__":

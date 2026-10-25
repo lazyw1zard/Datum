@@ -1,5 +1,6 @@
-"""3MF without extra packages: read the mesh (components, transforms, units), write a plain one,
-and pull the embedded thumbnail. The thumbnail part comes from CADRelay as it was."""
+"""3MF without extra packages: read the mesh (components, transforms, units), write a plain one, put a mesh
+into a slicer project used as a template, and pull the embedded thumbnail. The thumbnail part comes from
+CADRelay as it was."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,6 +8,7 @@ from pathlib import Path
 from xml.etree import ElementTree
 from zipfile import BadZipFile, ZipFile, ZIP_DEFLATED
 import io
+import re
 
 import numpy as np
 
@@ -219,18 +221,22 @@ _CONTENT_TYPES = (
 )
 
 
+def _mesh_xml(vertices: np.ndarray, faces: np.ndarray, prefix: str = "") -> str:
+    vtext = "".join(f'<{prefix}vertex x="{x:.7g}" y="{y:.7g}" z="{z:.7g}"/>' for x, y, z in vertices)
+    ttext = "".join(f'<{prefix}triangle v1="{a}" v2="{b}" v3="{c}"/>' for a, b, c in faces)
+    return (f"<{prefix}mesh><{prefix}vertices>{vtext}</{prefix}vertices>"
+            f"<{prefix}triangles>{ttext}</{prefix}triangles></{prefix}mesh>")
+
+
 def write_mesh(path: str | Path, vertices: np.ndarray, faces: np.ndarray, *, name: str = "part",
                thumbnail_png: bytes | None = None) -> None:
     """A plain 3MF with one object, millimetres. Slicers add their own settings when they open it."""
-    vtext = "".join(f'<vertex x="{x:.6g}" y="{y:.6g}" z="{z:.6g}"/>' for x, y, z in vertices)
-    ttext = "".join(f'<triangle v1="{a}" v2="{b}" v3="{c}"/>' for a, b, c in faces)
     model = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         f'<model unit="millimeter" xml:lang="en-US" xmlns="{CORE_NS}">'
         f'<metadata name="Title">{_xml_escape(name)}</metadata>'
-        f'<resources><object id="1" type="model" name="{_xml_escape(name)}"><mesh>'
-        f"<vertices>{vtext}</vertices><triangles>{ttext}</triangles>"
-        '</mesh></object></resources><build><item objectid="1"/></build></model>'
+        f'<resources><object id="1" type="model" name="{_xml_escape(name)}">{_mesh_xml(vertices, faces)}'
+        '</object></resources><build><item objectid="1"/></build></model>'
     )
     rels = ['<Relationship Target="/3D/3dmodel.model" Id="rel0" Type="' + MODEL_REL_TYPE + '"/>']
     if thumbnail_png:
@@ -247,3 +253,87 @@ def write_mesh(path: str | Path, vertices: np.ndarray, faces: np.ndarray, *, nam
 
 def _xml_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+# ---------- a slicer project as a template ----------
+
+def replace_mesh(template: str | Path, out: str | Path, vertices: np.ndarray, faces: np.ndarray) -> dict:
+    """Put a mesh (millimetres) into a slicer project (QIDI, Bambu, Orca, ...) in place of its only object.
+
+    Everything else stays as the human left it: print settings, the plate, the object's placement and scale.
+    The new mesh sits in the object the way the old one did (centre in plan, bottom at the same height), so it
+    lands on the same spot of the bed. The model file is edited as text, so whatever the slicer wrote around
+    the mesh survives byte for byte; mesh statistics it keeps in Metadata/model_settings.config are updated."""
+    template, out = Path(template), Path(out)
+    with ZipFile(template) as archive:
+        infos = archive.infolist()
+        entries = {i.filename: archive.read(i.filename) for i in infos}
+        root_name = _root_model_name(archive)
+    names = {_normalize_zip_name(n): n for n in entries}
+
+    def document(name: str) -> ElementTree.Element:
+        return ElementTree.fromstring(entries[names[_normalize_zip_name(name)]])
+
+    items = list(document(root_name).iter(f"{{{CORE_NS}}}item"))
+    if len(items) != 1:
+        raise ValueError(f"a template must hold one object on the plate, this one has {len(items)}")
+    doc_name = items[0].attrib.get(f"{{{PROD_NS}}}path") or root_name
+    object_id = items[0].attrib["objectid"]
+    transform = _matrix(items[0].attrib.get("transform"))
+    for _ in range(16):                                 # down the components to the one mesh
+        obj = next((o for o in document(doc_name).iter(f"{{{CORE_NS}}}object") if o.attrib.get("id") == object_id),
+                   None)
+        if obj is None:
+            raise ValueError(f"3MF object {object_id} not found in {doc_name}")
+        mesh = obj.find(f"{{{CORE_NS}}}mesh")
+        components = obj.findall(f"{{{CORE_NS}}}components/{{{CORE_NS}}}component")
+        if mesh is not None and not components:
+            break
+        if mesh is not None or len(components) != 1:
+            raise ValueError("the template object has several parts (modifiers or a multi-part object); "
+                             "one mesh is expected")
+        transform = _matrix(components[0].attrib.get("transform")) @ transform
+        doc_name = components[0].attrib.get(f"{{{PROD_NS}}}path") or doc_name
+        object_id = components[0].attrib["objectid"]
+    else:
+        raise ValueError("3MF components nest too deep")
+
+    unit = UNIT_MM.get(document(doc_name).attrib.get("unit", "millimeter"), 1.0)
+    old = np.array([[float(e.attrib[k]) for k in "xyz"] for e in mesh.iter(f"{{{CORE_NS}}}vertex")])
+    new = np.asarray(vertices, float) / unit
+    if len(old):
+        centre_old, centre_new = (old.min(axis=0) + old.max(axis=0)) / 2, (new.min(axis=0) + new.max(axis=0)) / 2
+        shift = np.r_[centre_old[:2] - centre_new[:2], old[:, 2].min() - new[:, 2].min()]
+    else:
+        shift = np.zeros(3)
+    key = names[_normalize_zip_name(doc_name)]
+    entries[key] = _swap_mesh(entries[key].decode("utf-8"), object_id, new + shift, faces).encode("utf-8")
+
+    settings = names.get("Metadata/model_settings.config")
+    if settings:                                        # Bambu-family slicers keep the source offset and face count
+        text = entries[settings].decode("utf-8")
+        text = re.sub(r'face_count="\d+"', f'face_count="{len(faces)}"', text)
+        for axis, value in zip("xyz", -shift):
+            value = round(float(value), 6) + 0.0            # no "-0" and no float dust
+            text = re.sub(rf'(key="source_offset_{axis}" value=")[^"]*(")',
+                          lambda m, v=value: f"{m.group(1)}{v:.9g}{m.group(2)}", text)
+        entries[settings] = text.encode("utf-8")
+
+    tmp = out.with_name(out.name + ".tmp")              # out may be the template itself
+    with ZipFile(tmp, "w") as archive:
+        for info in infos:
+            archive.writestr(info, entries[info.filename])
+    tmp.replace(out)
+    return {"model": _normalize_zip_name(doc_name), "triangles": int(len(faces)),
+            "scale": [round(float(s), 4) for s in np.linalg.norm(transform[:3, :3], axis=1)],
+            "print_settings": "Metadata/project_settings.config" in names}
+
+
+def _swap_mesh(text: str, object_id: str, vertices: np.ndarray, faces: np.ndarray) -> str:
+    head = re.search(rf'<(\w+:)?object\b[^>]*?\bid="{re.escape(object_id)}"', text)
+    if head is None:
+        raise ValueError(f"3MF object {object_id} not found")
+    prefix = head.group(1) or ""
+    start = text.index(f"<{prefix}mesh", head.end())
+    end = text.index(f"</{prefix}mesh>", start) + len(f"</{prefix}mesh>")
+    return text[:start] + _mesh_xml(vertices, faces, prefix) + text[end:]

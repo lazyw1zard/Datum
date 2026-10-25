@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from . import config, mesh as meshes, scad, viewer
+from . import config, mesh as meshes, scad, three_mf, viewer
 from .engines import openscad
 
 SLUG = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -83,6 +83,7 @@ class Store:
             raise PartError(f"part {slug!r} already exists")
         folder.mkdir(parents=True, exist_ok=True)
         copied: list[str] = []
+        src = None
         if source is None:
             engine, name = "openscad", "part.scad"
             (folder / name).write_text(TEMPLATE.format(title=title or slug), encoding="utf-8")
@@ -102,14 +103,15 @@ class Store:
                 raise PartError(f"unsupported source {suffix}: use .scad or a mesh/CAD file "
                                 f"({', '.join(sorted(meshes.SUPPORTED_FORMATS))})")
         data = {"name": slug, "title": title or slug, "description": description, "engine": engine,
-                "source": name, "origin": str(source) if source else None, "created": _now(),
+                "source": name, "origin": str(src) if src else None, "created": _now(),
                 "updated": _now(), "current": None}
         self._save(slug, data)
         return {**data, "copied_includes": copied}
 
-    def _copy_includes(self, src: Path, folder: Path) -> list[str]:
-        """Bring along files the source includes by relative path, so the part builds on its own."""
-        copied = []
+    @staticmethod
+    def _includes(src: Path) -> list[tuple[Path, Path]]:
+        """Files the source includes by relative path: (file, path inside the part folder)."""
+        found = []
         pending = [(src, Path("."))]
         seen = set()
         while pending:
@@ -117,14 +119,55 @@ class Store:
             for target in _INCLUDE.findall(file.read_text(encoding="utf-8", errors="replace")):
                 candidate = (file.parent / target)
                 if not candidate.is_file() or candidate.resolve() in seen:
-                    continue            # a library on OPENSCADPATH, or already copied
+                    continue            # a library on OPENSCADPATH, or already found
                 seen.add(candidate.resolve())
-                dest = folder / rel / target
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(candidate, dest)
-                copied.append(str((rel / target).as_posix()))
+                found.append((candidate, rel / target))
                 pending.append((candidate, (rel / target).parent))
+        return found
+
+    def _copy_includes(self, src: Path, folder: Path) -> list[str]:
+        """Bring along files the source includes by relative path, so the part builds on its own."""
+        copied = []
+        for file, rel in self._includes(src):
+            dest = folder / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(file, dest)
+            copied.append(rel.as_posix())
         return copied
+
+    def pull(self, slug: str, *, force: bool = False) -> dict:
+        """Take the source again from where the part came from (`origin`), e.g. a generator's output, with the
+        files it includes. Edits made in the part itself after its last build are not overwritten unless force."""
+        part = self.load(slug)
+        if not part.get("origin"):
+            raise PartError(f"part {slug!r} was not made from a file: there is no origin to pull from")
+        src = Path(part["origin"]).expanduser()
+        if not src.is_file():
+            raise PartError(f"origin of {slug!r} is gone: {src}")
+        folder = self.dir(slug)
+        dest = folder / part["source"]
+        if src.suffix.lower() != dest.suffix.lower():
+            raise PartError(f"origin {src.name} and the part source {dest.name} are of different kinds")
+        built = self.versions(slug)
+        if built and dest.exists() and not force:
+            last = json.loads((self.dir(slug) / "versions" / built[-1]["version"] / "version.json")
+                              .read_text(encoding="utf-8"))
+            if _sha256(dest) != last.get("source_sha256"):
+                raise PartError(f"{dest.name} was edited after {last['version']} was built; pulling would lose "
+                                "that (force=true to discard it)")
+        includes = self._includes(src) if part["engine"] == "openscad" else []
+        changed = []
+        for file, rel in [(src, Path(dest.name)), *includes]:
+            target = folder / rel
+            if target.is_file() and target.read_bytes() == file.read_bytes():
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(file, target)
+            changed.append(rel.as_posix())
+        if changed:
+            part["updated"] = _now()
+            self._save(slug, part)
+        return {"origin": str(src), "changed": changed}
 
     def list(self) -> list[dict]:
         if not self.root.exists():
@@ -280,3 +323,13 @@ class Store:
             shutil.copy2(vdir / "model.stl", out)
             return out
         return meshes.save(meshes.load(vdir / "model.stl"), out, name=self.load(slug)["title"])
+
+    def export_into(self, slug: str, out: str | Path, template: str | Path, version: str | None = None) -> dict:
+        """The version's mesh inside a slicer project: its print settings, plate and placement stay."""
+        out, template = Path(out).expanduser(), Path(template).expanduser()
+        if out.suffix.lower() != ".3mf" or template.suffix.lower() != ".3mf":
+            raise PartError("a template export takes a .3mf project and writes a .3mf")
+        if not template.is_file():
+            raise PartError(f"no such template: {template}")
+        part_mesh = meshes.load(self.version_dir(slug, version) / "model.stl")
+        return {"path": out, **three_mf.replace_mesh(template, out, part_mesh.vertices, part_mesh.faces)}

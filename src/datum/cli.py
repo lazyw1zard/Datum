@@ -66,6 +66,13 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--note", default="")
     s.add_argument("--views", help=f"виды превью через запятую: {', '.join(VIEWS)}")
 
+    s = sub.add_parser("pull", help="взять исходник заново оттуда, откуда пришла деталь (генератор переписал), "
+                                    "и собрать, если он изменился")
+    s.add_argument("part")
+    s.add_argument("--note", default="")
+    s.add_argument("--force", action="store_true", help="затереть правки исходника в самой детали после сборки")
+    s.add_argument("--views", help=f"виды превью через запятую: {', '.join(VIEWS)}")
+
     s = sub.add_parser("versions", help="история версий")
     s.add_argument("part")
 
@@ -90,6 +97,8 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("part")
     s.add_argument("out")
     s.add_argument("--v", dest="ver")
+    s.add_argument("--template", help="проект слайсера .3mf: сетка встанет вместо его объекта, "
+                                      "настройки печати и место на столе останутся")
     return p
 
 
@@ -113,6 +122,9 @@ def run(args: argparse.Namespace) -> dict:
     if cmd == "build":
         views = [v.strip() for v in args.views.split(",")] if args.views else None
         return ops.build(store, args.part, note=args.note, views=views)
+    if cmd == "pull":
+        views = [v.strip() for v in args.views.split(",")] if args.views else None
+        return ops.pull(store, args.part, note=args.note, force=args.force, views=views)
     if cmd == "versions":
         return ops.versions(store, args.part)
     if cmd == "section":
@@ -122,7 +134,7 @@ def run(args: argparse.Namespace) -> dict:
     if cmd == "view":
         return ops.view(store, args.part, args.ver, open_browser=args.open, refresh=args.refresh)
     if cmd == "export":
-        return ops.export(store, args.part, args.out, args.ver)
+        return ops.export(store, args.part, args.out, args.ver, template=args.template)
     raise PartError(f"unknown command {cmd}")
 
 

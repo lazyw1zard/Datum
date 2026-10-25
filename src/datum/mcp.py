@@ -21,8 +21,10 @@ INSTRUCTIONS = (
     f"{TITLE} keeps parametric 3D parts as folders with immutable versions. Typical loop: list_parts / show_part -> "
     "part_params -> set_params (rewrites the OpenSCAD source and builds a new version, returns previews) -> "
     "measure or section to check real dimensions on the mesh (holes as Ø, hex pockets as S) -> view_path gives a "
-    "self-contained 3D view (view.html) to hand to the human. Builds that fail are kept as versions with errors; "
-    "the current version stays the last good one. Units are millimetres, Z is up."
+    "self-contained 3D view (view.html) to hand to the human. A part made from a file a generator writes is "
+    "updated with pull_part; for printing, export_mesh with template puts the mesh into the human's slicer project. "
+    "Builds that fail are kept as versions with errors; the current version stays the last good one. Units are "
+    "millimetres, Z is up."
 )
 
 _PART = {"part": {"type": "string", "description": "part name (folder), e.g. 'vtulka'"}}
@@ -54,6 +56,12 @@ TOOLS: dict[str, dict[str, Any]] = {
                    "schema": _schema({**_PART, "note": {"type": "string"},
                                       "views": {"type": "array", "items": {"type": "string", "enum": list(VIEWS)}}},
                                      ["part"])},
+    "pull_part": {"description": "Take the source again from where the part came from (its origin file, e.g. a "
+                                 "generator's output) and build a new version if it changed. Refuses to overwrite "
+                                 "edits made in the part after its last build unless force=true.",
+                  "schema": _schema({**_PART, "note": {"type": "string"}, "force": {"type": "boolean", "default": False},
+                                     "views": {"type": "array", "items": {"type": "string", "enum": list(VIEWS)}}},
+                                    ["part"])},
     "part_versions": {"description": "Version history with notes and parameter changes.", "schema": _schema(_PART, ["part"])},
     "section": {"description": "Cut the built mesh with a plane and read outlines: round holes as Ø, regular polygons "
                                "(hex nut pockets) as S across flats, other outlines by size. Also writes an SVG.",
@@ -67,8 +75,11 @@ TOOLS: dict[str, dict[str, Any]] = {
                                    **_VERSION}, ["part"])},
     "view_path": {"description": "Path of the self-contained 3D view (view.html: rotate, sections by eye, measure "
                                  "two points) to send to the human.", "schema": _schema({**_PART, **_VERSION}, ["part"])},
-    "export_mesh": {"description": "Save a version's mesh as .stl, .3mf, .glb, .obj or .ply.",
+    "export_mesh": {"description": "Save a version's mesh as .stl, .3mf, .glb, .obj or .ply. With template (a slicer "
+                                   "project .3mf holding one object) the mesh replaces that object: print settings, "
+                                   "the plate and the object's placement and scale stay as the human set them.",
                     "schema": _schema({**_PART, "out": {"type": "string", "description": "target file path"},
+                                       "template": {"type": "string", "description": "slicer project .3mf"},
                                        **_VERSION}, ["part", "out"])},
 }
 
@@ -96,12 +107,14 @@ def call_tool(store: Store, name: str, args: dict) -> tuple[str, list[dict], boo
         "set_params": lambda: ops.set_params(store, part, args.get("params") or {}, force=args.get("force", False),
                                              note=args.get("note", ""), build_after=args.get("build", True)),
         "build_part": lambda: ops.build(store, part, note=args.get("note", ""), views=args.get("views")),
+        "pull_part": lambda: ops.pull(store, part, note=args.get("note", ""), force=args.get("force", False),
+                                      views=args.get("views")),
         "part_versions": lambda: ops.versions(store, part),
         "section": lambda: ops.section(store, part, args.get("axis", "z"), args.get("at"), version),
         "measure": lambda: ops.measure(store, part, [(c["axis"], float(c["at"])) for c in args.get("cuts") or []],
                                        version),
         "view_path": lambda: ops.view(store, part, version),
-        "export_mesh": lambda: ops.export(store, part, args["out"], version),
+        "export_mesh": lambda: ops.export(store, part, args["out"], version, template=args.get("template")),
     }
     if name not in handlers:
         return f"unknown tool {name}", [], True
@@ -111,7 +124,9 @@ def call_tool(store: Store, name: str, args: dict) -> tuple[str, list[dict], boo
         message = exc.args[0] if isinstance(exc, KeyError) and exc.args else str(exc)
         return f"{NAME}: {message}", [], True
     images = []
-    if name in {"show_part", "new_part", "build_part"} or (name == "set_params" and args.get("build", True)):
+    built = name in {"new_part", "build_part"} or (name == "pull_part" and result.get("changed")) \
+        or (name == "set_params" and args.get("build", True))
+    if name == "show_part" or built:
         if result.get("ok", True):
             images = _images(store, part, version if name == "show_part" else None)
     return result["text"], images, not result.get("ok", True)

@@ -44,8 +44,14 @@ datum measure vtulka --cut z=5,17.5,20                    # габарит и с
 datum section vtulka --at 17.5                            # «отверстие: 6-gon, S8.3»
 datum view vtulka --open                                  # 3D-просмотр в браузере
 datum versions vtulka
+datum pull zakladka --note "клюв крупнее"                 # генератор переписал исходник: взять заново и собрать
 datum export vtulka out.3mf
+datum export vtulka out.3mf --template moy_proekt.3mf     # в проект слайсера: его настройки и место на столе
 ```
+
+`pull` берёт исходник оттуда, откуда деталь создана (`origin` в `part.json`), вместе с включаемыми файлами, и собирает версию, только если что-то изменилось. Правки, сделанные в самой детали после её последней сборки, он не затирает без `--force`.
+
+`export --template` кладёт сетку версии в проект QIDI Studio, Bambu Studio или Orca вместо его единственного объекта. Настройки печати, стол, место и масштаб объекта остаются такими, как их оставил человек, а сетка встаёт так же, как стояла прежняя: центр в плане, низ на той же высоте.
 
 У каждой команды есть `--json` для машинного ответа.
 
@@ -63,7 +69,7 @@ claude mcp add datum -- datum-mcp                 # Claude Code
 command = "datum-mcp"
 ```
 
-Инструменты: `doctor`, `list_parts`, `show_part`, `part_params`, `new_part`, `set_params`, `build_part`, `part_versions`, `section`, `measure`, `view_path`, `export_mesh`.
+Инструменты: `doctor`, `list_parts`, `show_part`, `part_params`, `new_part`, `set_params`, `build_part`, `pull_part`, `part_versions`, `section`, `measure`, `view_path`, `export_mesh` (с `template` — в проект слайсера).
 
 ## Переименование
 
@@ -85,7 +91,6 @@ python -m unittest discover -s tests
 ## Дальше
 
 - Fusion 360 вторым движком, через его MCP-коннектор: твёрдые тела, STEP, CAM.
-- Упаковка в 3MF по шаблону проекта слайсера (профиль QIDI, PETG).
 - Галерея всех деталей и версий: маленький локальный сервер.
 - Согласование версий (принять / отклонить) — если понадобится, как было в CADRelay.
 

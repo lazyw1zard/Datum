@@ -128,6 +128,17 @@ def set_params(store: Store, slug: str, updates: dict[str, Any], *, force: bool 
     return build(store, slug, note=note, changes=notes)
 
 
+def pull(store: Store, slug: str, *, note: str = "", force: bool = False, views: list[str] | None = None) -> dict:
+    """Source again from the part's origin (e.g. a generator wrote it anew) and a new version, if it changed."""
+    pulled = store.pull(slug, force=force)
+    origin = Path(pulled["origin"])
+    if not pulled["changed"]:
+        return {"ok": True, "changed": [], "text": f"{slug}: {origin} не изменился — новая версия не нужна"}
+    result = build(store, slug, note=note or f"из {origin.name}", views=views)
+    head = f"{slug}: взято из {origin} ({', '.join(pulled['changed'])})"
+    return {**result, "changed": pulled["changed"], "text": head + "\n" + result["text"]}
+
+
 def new(store: Store, slug: str, *, source: str | None = None, title: str | None = None,
         description: str = "", build_after: bool = True) -> dict:
     created = store.create(slug, source=source, title=title, description=description)
@@ -173,9 +184,18 @@ def view(store: Store, slug: str, version: str | None = None, *, open_browser: b
     return {"path": str(path), "text": str(path)}
 
 
-def export(store: Store, slug: str, out: str, version: str | None = None) -> dict:
-    path = store.export(slug, out, version)
-    return {"path": str(path), "text": f"сохранено: {path}"}
+def export(store: Store, slug: str, out: str, version: str | None = None, template: str | None = None) -> dict:
+    if not template:
+        path = store.export(slug, out, version)
+        return {"path": str(path), "text": f"сохранено: {path}"}
+    info = store.export_into(slug, out, template, version)
+    lines = [f"сохранено: {info['path']} — сетка вместо объекта проекта {Path(template).name}, "
+             f"{'настройки печати, ' if info['print_settings'] else ''}стол и место на нём — оттуда"]
+    if any(abs(s - 1) > 1e-3 for s in info["scale"]):
+        lines.append("масштаб объекта в проекте сохранён: " + " × ".join(f"{s:g}" for s in info["scale"])
+                     + " (по x, y, z)")
+    lines.append("превью внутри проекта старое: слайсер обновит его при нарезке")
+    return {**info, "path": str(info["path"]), "text": "\n".join(lines)}
 
 
 def versions(store: Store, slug: str) -> dict:
@@ -185,5 +205,5 @@ def versions(store: Store, slug: str) -> dict:
     return {"versions": items, "text": "\n".join(lines) or "версий нет"}
 
 
-__all__ = ["PartError", "Store", "doctor", "list_parts", "show", "params", "build", "set_params", "new",
+__all__ = ["PartError", "Store", "doctor", "list_parts", "show", "params", "build", "set_params", "pull", "new",
            "section", "measure", "view", "export", "versions", "preview_paths"]

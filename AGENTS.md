@@ -14,6 +14,12 @@ Datum keeps parametric 3D parts as folders with immutable versions. You drive it
    gives round holes as Ø, regular polygons (nut pockets) as S across flats, other outlines by their inner/outer
    diameters around the centre. Look at `preview_iso.png` / `preview_under.png`.
 5. Hand the human `view.html` of the version (`datum view <part>`): a self-contained 3D view, no server needed.
+6. For printing, if the human has a slicer project for the part: `datum export <part> out.3mf --template
+   <project>.3mf` puts the mesh in place of the project's object; print settings, placement and scale stay theirs.
+   Write next to the project, not over it, unless they ask.
+
+A part whose source a generator writes (its `origin` in `part.json`) is updated with `datum pull <part>`: it takes
+the source again and builds only if it changed. Do not copy the file into the part by hand.
 
 A failed build stays as a version with `errors` and `build.log`; the current version stays the last good one.
 Notes and parameter changes are recorded in `version.json` and shown by `datum versions <part>`.
