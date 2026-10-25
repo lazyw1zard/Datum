@@ -123,7 +123,7 @@ class ThreeMF(unittest.TestCase):
             self.assertTrue(np.allclose(loaded.bounds, original.bounds, atol=1e-4))
 
     def test_components_and_transforms(self):
-        """Slicers (QIDI, Bambu) put meshes in separate model files and reference them as components."""
+        """Bambu Studio and its forks put meshes in separate model files and reference them as components."""
         ns, prod = three_mf.CORE_NS, three_mf.PROD_NS
         part = (f'<model xmlns="{ns}" unit="millimeter"><resources><object id="1" type="model"><mesh><vertices>'
                 '<vertex x="0" y="0" z="0"/><vertex x="1" y="0" z="0"/><vertex x="0" y="1" z="0"/>'
@@ -144,15 +144,15 @@ class ThreeMF(unittest.TestCase):
             self.assertTrue(np.allclose(v.min(axis=0), [100, 0, 50]))
 
 
-def slicer_project(path: Path, items: int = 1) -> None:
-    """A project the way QIDI/Bambu save it: the mesh in its own model file, centred, under a component;
-    the item squashed to half height and placed on the plate; settings beside it."""
+def bambu_project(path: Path, items: int = 1) -> None:
+    """A project the way Bambu Studio and its forks (Orca, QIDI Studio, ...) save it: the mesh in its own model
+    file, centred, under a component; the item squashed to half height and placed on the plate; settings beside."""
     ns, prod = three_mf.CORE_NS, three_mf.PROD_NS
     box = trimesh.creation.box(extents=[10, 10, 2])
     verts = "".join(f'<vertex x="{x:g}" y="{y:g}" z="{z:g}"/>' for x, y, z in box.vertices)
     tris = "".join(f'<triangle v1="{a}" v2="{b}" v3="{c}"/>' for a, b, c in box.faces)
     part = (f'<?xml version="1.0" encoding="UTF-8"?>\n<model unit="millimeter" xmlns="{ns}" xmlns:p="{prod}">\n'
-            ' <metadata name="QIDIStudio:3mfVersion">1</metadata>\n <resources>\n'
+            ' <metadata name="BambuStudio:3mfVersion">1</metadata>\n <resources>\n'
             f'  <object id="1" p:UUID="00010000-aaaa" type="model">\n   <mesh><vertices>{verts}</vertices>'
             f'<triangles>{tris}</triangles></mesh>\n  </object>\n </resources>\n <build/>\n</model>')
     item = '<item objectid="2" transform="1 0 0 0 1 0 0 0 0.5 100 100 0.5" printable="1"/>'
@@ -174,11 +174,37 @@ def slicer_project(path: Path, items: int = 1) -> None:
         z.writestr("Metadata/project_settings.config", '{"layer_height": "0.2", "brim_width": "5"}')
 
 
+def prusa_project(path: Path, volumes: int = 1) -> None:
+    """A project the way PrusaSlicer saves it: the mesh right in the object, centred, the item placed on the bed;
+    each volume's triangle range and source offset in Slic3r_PE_model.config."""
+    ns = three_mf.CORE_NS
+    box = trimesh.creation.box(extents=[10, 10, 2])
+    verts = "".join(f'<vertex x="{x:g}" y="{y:g}" z="{z:g}"/>' for x, y, z in box.vertices)
+    tris = "".join(f'<triangle v1="{a}" v2="{b}" v3="{c}"/>' for a, b, c in box.faces)
+    root = (f'<model unit="millimeter" xmlns="{ns}" xmlns:slic3rpe="http://schemas.slic3r.org/3mf/2017/06">'
+            '<metadata name="slic3rpe:Version3mf">1</metadata><resources><object id="1" type="model">'
+            f'<mesh><vertices>{verts}</vertices><triangles>{tris}</triangles></mesh></object></resources>'
+            '<build><item objectid="1" transform="1 0 0 0 1 0 0 0 1 50 50 1" printable="1"/></build></model>')
+    half = len(box.faces) // volumes
+    vols = "".join(f'<volume firstid="{i * half}" lastid="{(i + 1) * half - 1}">'
+                   '<metadata type="volume" key="source_offset_z" value="1"/><mesh edges_fixed="0"/></volume>'
+                   for i in range(volumes))
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("_rels/.rels", '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                   f'<Relationship Target="/3D/3dmodel.model" Id="rel-1" Type="{three_mf.MODEL_REL_TYPE}"/>'
+                   '</Relationships>')
+        z.writestr("3D/3dmodel.model", root)
+        z.writestr("Metadata/Slic3r_PE.config", "; layer_height = 0.2\n; brim_width = 5\n")
+        z.writestr("Metadata/Slic3r_PE_model.config",
+                   f'<?xml version="1.0" encoding="UTF-8"?>\n<config><object id="1" instances_count="1">{vols}'
+                   '</object></config>')
+
+
 class Template(unittest.TestCase):
     def test_mesh_goes_into_the_project(self):
         with tempfile.TemporaryDirectory() as tmp:
             project, out = Path(tmp) / "project.3mf", Path(tmp) / "out.3mf"
-            slicer_project(project)
+            bambu_project(project)
             new = tube()                                     # 25 × 25 × 10, centred on the origin
             info = three_mf.replace_mesh(project, out, new.vertices, new.faces)
             self.assertEqual(info["scale"], [1.0, 1.0, 0.5])
@@ -188,7 +214,7 @@ class Template(unittest.TestCase):
                 self.assertEqual(a.read("Metadata/project_settings.config"), b.read("Metadata/project_settings.config"))
                 model = b.read("3D/Objects/object_1.model").decode("utf-8")
                 config = b.read("Metadata/model_settings.config").decode("utf-8")
-            self.assertIn('<metadata name="QIDIStudio:3mfVersion">1</metadata>', model)
+            self.assertIn('<metadata name="BambuStudio:3mfVersion">1</metadata>', model)
             self.assertIn('p:UUID="00010000-aaaa"', model)
             # on the same spot of the bed: bottom on the plate, centre at (100, 100), the human's half height kept
             v, f = three_mf.read_mesh(out)
@@ -202,7 +228,32 @@ class Template(unittest.TestCase):
     def test_one_object_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "two.3mf"
-            slicer_project(project, items=2)
+            bambu_project(project, items=2)
+            with self.assertRaises(ValueError):
+                three_mf.replace_mesh(project, Path(tmp) / "out.3mf", tube().vertices, tube().faces)
+
+    def test_prusaslicer_volume_range(self):
+        """PrusaSlicer keeps the mesh in the object itself and each volume's triangle range beside it:
+        a stale range would break the project."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project, out = Path(tmp) / "prusa.3mf", Path(tmp) / "out.3mf"
+            prusa_project(project)
+            new = tube()
+            info = three_mf.replace_mesh(project, out, new.vertices, new.faces)
+            self.assertTrue(info["print_settings"])
+            with zipfile.ZipFile(project) as a, zipfile.ZipFile(out) as b:
+                self.assertEqual(a.read("Metadata/Slic3r_PE.config"), b.read("Metadata/Slic3r_PE.config"))
+                config = b.read("Metadata/Slic3r_PE_model.config").decode("utf-8")
+            self.assertIn(f'<volume firstid="0" lastid="{len(new.faces) - 1}">', config)
+            self.assertIn('key="source_offset_z" value="-4"', config)
+            v, f = three_mf.read_mesh(out)
+            self.assertTrue(np.allclose(v.min(axis=0), [37.5, 37.5, 0.0], atol=1e-4))
+            self.assertTrue(np.allclose(v.max(axis=0), [62.5, 62.5, 10.0], atol=1e-4))
+
+    def test_several_volumes_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "prusa2.3mf"
+            prusa_project(project, volumes=2)
             with self.assertRaises(ValueError):
                 three_mf.replace_mesh(project, Path(tmp) / "out.3mf", tube().vertices, tube().faces)
 

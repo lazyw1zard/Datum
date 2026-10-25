@@ -257,13 +257,20 @@ def _xml_escape(text: str) -> str:
 
 # ---------- a slicer project as a template ----------
 
+# Per-object data slicers keep beside the model that depend on the mesh. The source offset comes from PrusaSlicer
+# and lives on in the Bambu Studio family (Orca, QIDI Studio, ...); the face count is Bambu's; the triangle range
+# of each volume is PrusaSlicer's. Other slicers keep nothing of the kind there and need only the mesh.
+_OBJECT_CONFIGS = ("Metadata/Slic3r_PE_model.config", "Metadata/model_settings.config")
+_PRINT_SETTINGS = ("Metadata/Slic3r_PE.config", "Metadata/project_settings.config", "Cura/")
+
+
 def replace_mesh(template: str | Path, out: str | Path, vertices: np.ndarray, faces: np.ndarray) -> dict:
-    """Put a mesh (millimetres) into a slicer project (QIDI, Bambu, Orca, ...) in place of its only object.
+    """Put a mesh (millimetres) into a slicer project saved as 3MF, in place of its only object.
 
     Everything else stays as the human left it: print settings, the plate, the object's placement and scale.
     The new mesh sits in the object the way the old one did (centre in plan, bottom at the same height), so it
     lands on the same spot of the bed. The model file is edited as text, so whatever the slicer wrote around
-    the mesh survives byte for byte; mesh statistics it keeps in Metadata/model_settings.config are updated."""
+    the mesh survives byte for byte; the per-object data in _OBJECT_CONFIGS are brought in line with the mesh."""
     template, out = Path(template), Path(out)
     with ZipFile(template) as archive:
         infos = archive.infolist()
@@ -306,18 +313,24 @@ def replace_mesh(template: str | Path, out: str | Path, vertices: np.ndarray, fa
         shift = np.r_[centre_old[:2] - centre_new[:2], old[:, 2].min() - new[:, 2].min()]
     else:
         shift = np.zeros(3)
-    key = names[_normalize_zip_name(doc_name)]
-    entries[key] = _swap_mesh(entries[key].decode("utf-8"), object_id, new + shift, faces).encode("utf-8")
-
-    settings = names.get("Metadata/model_settings.config")
-    if settings:                                        # Bambu-family slicers keep the source offset and face count
-        text = entries[settings].decode("utf-8")
+    updated = {}
+    for config_name in _OBJECT_CONFIGS:
+        if config_name not in names:
+            continue
+        text = entries[names[config_name]].decode("utf-8")
+        if len(re.findall(r"<volume\b", text)) > 1 or len(re.findall(r"<part\b", text)) > 1:
+            raise ValueError("the template object has several parts (modifiers or a multi-part object); "
+                             "one mesh is expected")
+        text = re.sub(r'(<volume\b[^>]*?\blastid=")\d+', lambda m: f"{m.group(1)}{len(faces) - 1}", text)
         text = re.sub(r'face_count="\d+"', f'face_count="{len(faces)}"', text)
         for axis, value in zip("xyz", -shift):
             value = round(float(value), 6) + 0.0            # no "-0" and no float dust
             text = re.sub(rf'(key="source_offset_{axis}" value=")[^"]*(")',
                           lambda m, v=value: f"{m.group(1)}{v:.9g}{m.group(2)}", text)
-        entries[settings] = text.encode("utf-8")
+        updated[names[config_name]] = text.encode("utf-8")
+    entries.update(updated)
+    key = names[_normalize_zip_name(doc_name)]
+    entries[key] = _swap_mesh(entries[key].decode("utf-8"), object_id, new + shift, faces).encode("utf-8")
 
     tmp = out.with_name(out.name + ".tmp")              # out may be the template itself
     with ZipFile(tmp, "w") as archive:
@@ -326,7 +339,7 @@ def replace_mesh(template: str | Path, out: str | Path, vertices: np.ndarray, fa
     tmp.replace(out)
     return {"model": _normalize_zip_name(doc_name), "triangles": int(len(faces)),
             "scale": [round(float(s), 4) for s in np.linalg.norm(transform[:3, :3], axis=1)],
-            "print_settings": "Metadata/project_settings.config" in names}
+            "print_settings": any(n.startswith(p) for n in names for p in _PRINT_SETTINGS)}
 
 
 def _swap_mesh(text: str, object_id: str, vertices: np.ndarray, faces: np.ndarray) -> str:
