@@ -33,4 +33,7 @@ Notes and parameter changes are recorded in `version.json` and shown by `datum v
 - The project name lives only in `src/datum/__init__.py`; derive names from `NAME`, `TITLE`, `ENV_PREFIX`.
   `tools/rename.py` renames everything else.
 - Models (parts, STL, 3MF) are data, not code: they live in the Datum home, never in this repository.
+- It is a general tool: no particular slicer, printer or anyone's parts in code, tests or docs. Name a slicer only
+  where its file format needs handling, and handle the others too (e.g. a template export covers PrusaSlicer and
+  the Bambu Studio family, not just the one at hand).
 - Tests: `python -m unittest discover -s tests`. Build tests need OpenSCAD and skip without it.
